@@ -1,0 +1,55 @@
+modules:
+  jira:customField:
+    - key: sfc-sf-account-field
+      name: Salesforce Account (Former Customer)
+      description: Pulls Salesforce Accounts with Status = "Former Customer"
+      type: string
+
+      view:
+        resource: sf-acct-field-fe
+
+      edit:
+        resource: sf-acct-field-fe
+
+      resolver:
+        function: main
+
+
+  jira:globalPage:
+    - key: sfc-sf-data-browser
+      title: Salesforce Data Browser
+      resource: sf-acct-field-fe
+
+      resolver:
+        function: main
+
+
+  function:
+    - key: main
+      handler: index.handler
+
+
+resources:
+  - key: sf-acct-field-fe
+    path: static/hello-world/build
+
+
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - storage:app
+
+  external:
+    fetch:
+      backend:
+        - https://login.salesforce.com
+        - https://test.salesforce.com
+        - https://*.my.salesforce.com
+        - https://*.salesforce.com
+
+
+app:
+  id: ari:cloud:ecosystem::app/3dd208b1-04b3-4310-a97c-8cc25e476599
+  runtime:
+    name: nodejs20.x
