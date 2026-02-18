@@ -1,52 +1,91 @@
 import api from "@forge/api";
 import Resolver from "@forge/resolver";
+import jwt from "jsonwebtoken";
 
 const resolver = new Resolver();
 
-/**
- * Get Salesforce OAuth Access Token using the Refresh Token Flow.
- * Caches the token to avoid concurrent refresh requests that trigger rate-limiting.
- *
- * Setup via Forge CLI:
- * forge variables set SALESFORCE_CLIENT_ID <your_consumer_key> --encrypt
- * forge variables set SALESFORCE_CLIENT_SECRET <your_consumer_secret> --encrypt
- * forge variables set SALESFORCE_REFRESH_TOKEN <your_token> --encrypt
- */
-let tokenCache = null;   // { access_token, instance_url, expiresAt }
-let tokenPromise = null;  // in-flight refresh promise (deduplicates concurrent calls)
+/* ===========================================================================
+   Salesforce / Account Engagement (Pardot) Authentication
+   Using JWT Bearer Flow (Client ID + Username + Private Key)
+=========================================================================== */
 
-async function getSalesforceAccessToken() {
-  // Return cached token if still valid (with 60s safety margin)
-  if (tokenCache && Date.now() < tokenCache.expiresAt) {
-    return { access_token: tokenCache.access_token, instance_url: tokenCache.instance_url };
+// ---------------------------------------------------------------------------
+// JWT Credentials from Forge Environment Variables
+//
+// forge variables set SALESFORCE_CLIENT_ID <consumer_key> --encrypt
+// forge variables set SALESFORCE_USERNAME user@company.com --encrypt
+// forge variables set SALESFORCE_JWT_PRIVATE_KEY "$(cat server.key)" --encrypt
+// ---------------------------------------------------------------------------
+function getJwtCredentials() {
+  const clientId = process.env.SALESFORCE_CLIENT_ID;
+  const username = process.env.SALESFORCE_USERNAME;
+  const privateKey = process.env.SALESFORCE_JWT_PRIVATE_KEY;
+
+  const missing = [];
+
+  if (!clientId) missing.push("SALESFORCE_CLIENT_ID");
+  if (!username) missing.push("SALESFORCE_USERNAME");
+  if (!privateKey) missing.push("SALESFORCE_JWT_PRIVATE_KEY");
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required Forge variables: ${missing.join(", ")}`
+    );
   }
 
-  // If a refresh is already in-flight, wait for it instead of making a duplicate request
-  if (tokenPromise) {
-    return tokenPromise;
-  }
-
-  tokenPromise = refreshAccessToken();
-  try {
-    const result = await tokenPromise;
-    return result;
-  } finally {
-    tokenPromise = null;
-  }
+  return { clientId, username, privateKey };
 }
 
-async function refreshAccessToken(retries = 2) {
-  const loginUrl = process.env.SALESFORCE_LOGIN_URL || "https://login.salesforce.com";
+function getBusinessUnitId() {
+  return process.env.SALESFORCE_BUSINESS_UNIT_ID || null;
+}
+
+// ---------------------------------------------------------------------------
+// Token Cache
+// ---------------------------------------------------------------------------
+let tokenCache = null;
+let tokenPromise = null;
+
+// ---------------------------------------------------------------------------
+// Salesforce Login URL
+// ---------------------------------------------------------------------------
+function getLoginUrl() {
+  return process.env.SALESFORCE_LOGIN_URL || "https://login.salesforce.com";
+}
+
+// ---------------------------------------------------------------------------
+// Pardot Base URL
+// ---------------------------------------------------------------------------
+function getPardotBaseUrl() {
+  return process.env.PARDOT_API_URL || "https://pi.pardot.com";
+}
+
+// ---------------------------------------------------------------------------
+// JWT Authentication
+// ---------------------------------------------------------------------------
+async function authenticateWithJwt() {
+  const { clientId, username, privateKey } = getJwtCredentials();
+  const loginUrl = getLoginUrl();
+
   const tokenEndpoint = `${loginUrl}/services/oauth2/token`;
 
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: process.env.SALESFORCE_CLIENT_ID,
-    client_secret: process.env.SALESFORCE_CLIENT_SECRET,
-    refresh_token: process.env.SALESFORCE_REFRESH_TOKEN,
+  const payload = {
+    iss: clientId,
+    sub: username,
+    aud: loginUrl,
+    exp: Math.floor(Date.now() / 1000) + 180,
+  };
+
+  const jwtToken = jwt.sign(payload, privateKey, {
+    algorithm: "RS256",
   });
 
-  console.log(`Refreshing Salesforce token at ${tokenEndpoint}`);
+  const params = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion: jwtToken,
+  });
+
+  console.log(`Authenticating with Salesforce (JWT) as ${username}`);
 
   const response = await api.fetch(tokenEndpoint, {
     method: "POST",
@@ -58,83 +97,257 @@ async function refreshAccessToken(retries = 2) {
 
   if (!response.ok) {
     const err = await response.text();
-
-    // Retry on transient "unknown_error" / "retry your request" from Salesforce
-    if (retries > 0 && response.status === 400 && err.includes("retry your request")) {
-      console.warn(`Transient Salesforce auth error, retrying (${retries} left)...`);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      return refreshAccessToken(retries - 1);
-    }
-
-    console.error(`Salesforce Auth Failed (HTTP ${response.status}): ${err}`);
-    throw new Error(`Salesforce Auth Failed: ${err}`);
+    console.error(`JWT Auth Failed (${response.status}): ${err}`);
+    throw new Error(err);
   }
 
   const auth = await response.json();
 
-  // Cache token for 55 minutes (Salesforce tokens typically expire in 1-2 hours)
-  tokenCache = {
-    access_token: auth.access_token,
-    instance_url: auth.instance_url,
-    expiresAt: Date.now() + 55 * 60 * 1000,
-  };
-
   return {
     access_token: auth.access_token,
-    instance_url: auth.instance_url
+    instance_url: auth.instance_url,
   };
 }
 
-/**
- * Shared Helper: Executes a SOQL query using the refreshed token
- */
-async function executeSalesforceQuery(soql) {
-  const auth = await getSalesforceAccessToken();
-  const url = `${auth.instance_url}/services/data/v60.0/query?q=${encodeURIComponent(soql)}`;
-
-  const resp = await api.fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${auth.access_token}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Salesforce Query Failed (${resp.status}): ${text}`);
-  }
-
-  return await resp.json();
-}
-
 // ---------------------------------------------------------------------------
-// Main Logic & Resolvers
+// Login Resolver
 // ---------------------------------------------------------------------------
-
-resolver.define("searchSalesforceAccounts", async ({ payload }) => {
+resolver.define("loginToSalesforce", async () => {
   try {
-    const query = payload.query || "";
-    const escapedQuery = query.replace(/'/g, "\\'");
+    const auth = await authenticateWithJwt();
 
-    let soql = `SELECT Id, Name FROM Account WHERE Status__c = 'Former Customer'`;
-    if (query) {
-      soql += ` AND Name LIKE '%${escapedQuery}%'`;
-    }
-    soql += ` ORDER BY Name LIMIT 20`;
+    tokenCache = {
+      access_token: auth.access_token,
+      instance_url: auth.instance_url,
+      expiresAt: Date.now() + 55 * 60 * 1000,
+    };
 
-    const data = await executeSalesforceQuery(soql);
+    console.log("Salesforce connected:", auth.instance_url);
 
-    return (data.records || []).map((r) => ({
-      id: r.Id,
-      name: r.Name,
-    }));
+    return {
+      connected: true,
+      instance_url: auth.instance_url,
+    };
+
   } catch (error) {
-    console.error("Salesforce Error:", error);
-    return { error: true, message: error.message };
+    console.error("loginToSalesforce error:", error);
+
+    return {
+      error: true,
+      message: error.message,
+    };
   }
 });
 
+// ---------------------------------------------------------------------------
+// Connection Check
+// ---------------------------------------------------------------------------
+resolver.define("checkSalesforceConnection", async () => {
+  try {
+    const hasCredentials =
+      !!process.env.SALESFORCE_USERNAME &&
+      !!process.env.SALESFORCE_CLIENT_ID &&
+      !!process.env.SALESFORCE_JWT_PRIVATE_KEY;
+
+    return {
+      connected: hasCredentials,
+      instance_url: tokenCache ? tokenCache.instance_url : null,
+    };
+
+  } catch (error) {
+    return { connected: false };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Disconnect
+// ---------------------------------------------------------------------------
+resolver.define("disconnectSalesforce", async () => {
+  tokenCache = null;
+  return { disconnected: true };
+});
+
+// ---------------------------------------------------------------------------
+// Get Valid Token
+// ---------------------------------------------------------------------------
+async function getSalesforceAccessToken() {
+
+  if (tokenCache && Date.now() < tokenCache.expiresAt) {
+    return {
+      access_token: tokenCache.access_token,
+      instance_url: tokenCache.instance_url,
+    };
+  }
+
+  if (tokenPromise) {
+    return tokenPromise;
+  }
+
+  tokenPromise = reauthenticate();
+
+  try {
+    return await tokenPromise;
+  } finally {
+    tokenPromise = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Re-authenticate
+// ---------------------------------------------------------------------------
+async function reauthenticate(retries = 2) {
+  try {
+
+    const auth = await authenticateWithJwt();
+
+    tokenCache = {
+      access_token: auth.access_token,
+      instance_url: auth.instance_url,
+      expiresAt: Date.now() + 55 * 60 * 1000,
+    };
+
+    return auth;
+
+  } catch (error) {
+
+    if (retries > 0) {
+      console.warn(`JWT auth retrying (${retries})...`);
+      await new Promise((r) => setTimeout(r, 1000));
+      return reauthenticate(retries - 1);
+    }
+
+    tokenCache = null;
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Build Headers
+// ---------------------------------------------------------------------------
+async function buildSalesforceHeaders(includePardotBuid = false) {
+
+  const auth = await getSalesforceAccessToken();
+
+  const headers = {
+    Authorization: `Bearer ${auth.access_token}`,
+    "Content-Type": "application/json",
+  };
+
+  if (includePardotBuid) {
+    const buid = getBusinessUnitId();
+    if (buid) {
+      headers["Pardot-Business-Unit-Id"] = buid;
+    }
+  }
+
+  return {
+    headers,
+    instance_url: auth.instance_url,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Execute SOQL
+// ---------------------------------------------------------------------------
+async function executeSalesforceQuery(soql) {
+
+  const { headers, instance_url } = await buildSalesforceHeaders();
+
+  const url =
+    `${instance_url}/services/data/v60.0/query?q=${encodeURIComponent(soql)}`;
+
+  const resp = await api.fetch(url, {
+    method: "GET",
+    headers,
+  });
+
+  if (!resp.ok) {
+
+    const text = await resp.text();
+
+    if (resp.status === 401) {
+
+      tokenCache = null;
+
+      const retry = await buildSalesforceHeaders();
+
+      const retryResp = await api.fetch(
+        `${retry.instance_url}/services/data/v60.0/query?q=${encodeURIComponent(soql)}`,
+        {
+          method: "GET",
+          headers: retry.headers,
+        }
+      );
+
+      if (!retryResp.ok) {
+        throw new Error(await retryResp.text());
+      }
+
+      return retryResp.json();
+    }
+
+    throw new Error(text);
+  }
+
+  return resp.json();
+}
+
+// ---------------------------------------------------------------------------
+// Pardot Requests
+// ---------------------------------------------------------------------------
+async function executePardotRequest(path, method = "GET", body = null) {
+
+  const { headers } = await buildSalesforceHeaders(true);
+
+  const url = `${getPardotBaseUrl()}${path}`;
+
+  const options = { method, headers };
+
+  if (body && method !== "GET") {
+    options.headers["Content-Type"] =
+      "application/x-www-form-urlencoded";
+    options.body = body;
+  }
+
+  const resp = await api.fetch(url, options);
+
+  if (!resp.ok) {
+
+    if (resp.status === 401) {
+
+      tokenCache = null;
+
+      const retry = await buildSalesforceHeaders(true);
+
+      const retryOptions = {
+        method,
+        headers: retry.headers,
+      };
+
+      if (body && method !== "GET") {
+        retryOptions.headers["Content-Type"] =
+          "application/x-www-form-urlencoded";
+        retryOptions.body = body;
+      }
+
+      const retryResp = await api.fetch(url, retryOptions);
+
+      if (!retryResp.ok) {
+        throw new Error(await retryResp.text());
+      }
+
+      return retryResp.json();
+    }
+
+    throw new Error(await resp.text());
+  }
+
+  return resp.json();
+}
+
+// ---------------------------------------------------------------------------
+// Object Config
+// ---------------------------------------------------------------------------
 const OBJECT_CONFIG = {
   Account: {
     fields: ["Id", "Name", "Industry", "Type", "Phone"],
@@ -145,84 +358,141 @@ const OBJECT_CONFIG = {
       { field: "Type", label: "Type", type: "picklist" },
     ],
   },
+
   Contact: {
     fields: ["Id", "FirstName", "LastName", "Email", "Phone", "Account.Name"],
     columns: ["First Name", "Last Name", "Email", "Phone", "Account"],
     searchField: "LastName",
     filterFields: [],
   },
+
   Opportunity: {
     fields: ["Id", "Name", "StageName", "Amount", "CloseDate", "Account.Name"],
     columns: ["Name", "Stage", "Amount", "Close Date", "Account"],
     searchField: "Name",
-    filterFields: [{ field: "StageName", label: "Stage", type: "picklist" }],
+    filterFields: [
+      { field: "StageName", label: "Stage", type: "picklist" },
+    ],
   },
 };
 
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
 resolver.define("getObjectMetadata", async () => {
   return OBJECT_CONFIG;
 });
 
+// ---------------------------------------------------------------------------
+// Picklists
+// ---------------------------------------------------------------------------
 resolver.define("getPicklistValues", async ({ payload }) => {
+
   try {
+
     const { objectType, fieldName } = payload;
-    const auth = await getSalesforceAccessToken();
-    const url = `${auth.instance_url}/services/data/v60.0/sobjects/${objectType}/describe`;
+
+    const { headers, instance_url } =
+      await buildSalesforceHeaders();
+
+    const url =
+      `${instance_url}/services/data/v60.0/sobjects/${objectType}/describe`;
 
     const resp = await api.fetch(url, {
       method: "GET",
-      headers: {
-        Authorization: `Bearer ${auth.access_token}`,
-        "Content-Type": "application/json",
-      },
+      headers,
     });
 
     if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(`Salesforce Describe Failed (${resp.status}): ${text}`);
+      throw new Error(await resp.text());
     }
 
     const describe = await resp.json();
-    const field = (describe.fields || []).find((f) => f.name === fieldName);
 
-    if (!field || !field.picklistValues) {
-      return [];
-    }
+    const field =
+      describe.fields.find((f) => f.name === fieldName);
+
+    if (!field || !field.picklistValues) return [];
 
     return field.picklistValues
-      .filter((pv) => pv.active)
-      .map((pv) => ({ label: pv.label, value: pv.value }));
+      .filter((p) => p.active)
+      .map((p) => ({
+        label: p.label,
+        value: p.value,
+      }));
+
   } catch (error) {
-    console.error("Picklist fetch error:", error);
-    return { error: true, message: error.message };
+
+    return {
+      error: true,
+      message: error.message,
+    };
   }
 });
 
+// ---------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------
 resolver.define("querySalesforce", async ({ payload }) => {
-  try {
-    const { objectType, search = "", filters = {}, limit = 50, offset = 0 } = payload;
-    const config = OBJECT_CONFIG[objectType];
-    
-    if (!config) throw new Error(`Unsupported object: ${objectType}`);
 
-    const whereClauses = [];
+  try {
+
+    const {
+      objectType,
+      search = "",
+      filters = {},
+      limit = 50,
+      offset = 0,
+    } = payload;
+
+    const config = OBJECT_CONFIG[objectType];
+
+    if (!config) {
+      throw new Error(`Unsupported object: ${objectType}`);
+    }
+
+    const where = [];
+
     if (search) {
-      whereClauses.push(`${config.searchField} LIKE '%${search.replace(/'/g, "\\'")}%'`);
+      where.push(
+        `${config.searchField} LIKE '%${search.replace(/'/g, "\\'")}%'`
+      );
     }
 
     for (const [field, value] of Object.entries(filters)) {
-      if (value) whereClauses.push(`${field} = '${String(value).replace(/'/g, "\\'")}'`);
+      if (value) {
+        where.push(
+          `${field} = '${String(value).replace(/'/g, "\\'")}'`
+        );
+      }
     }
 
-    let soql = `SELECT ${config.fields.join(", ")} FROM ${objectType}`;
-    if (whereClauses.length > 0) soql += " WHERE " + whereClauses.join(" AND ");
-    soql += ` ORDER BY ${config.searchField} ASC LIMIT ${limit} OFFSET ${offset}`;
+    let soql =
+      `SELECT ${config.fields.join(", ")} FROM ${objectType}`;
+
+    if (where.length) {
+      soql += " WHERE " + where.join(" AND ");
+    }
+
+    soql +=
+      ` ORDER BY ${config.searchField} ASC LIMIT ${limit} OFFSET ${offset}`;
 
     const data = await executeSalesforceQuery(soql);
-    return { records: data.records || [], totalSize: data.totalSize || 0 };
+
+    return {
+      records: data.records || [],
+      totalSize: data.totalSize || 0,
+    };
+
   } catch (error) {
-    return { error: true, message: error.message };
+
+    return {
+      error: true,
+      message: error.message,
+    };
   }
 });
+
+// ---------------------------------------------------------------------------
 
 export const handler = resolver.getDefinitions();

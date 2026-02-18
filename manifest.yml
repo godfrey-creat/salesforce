@@ -47,6 +47,8 @@ permissions:
         - https://test.salesforce.com
         - https://*.my.salesforce.com
         - https://*.salesforce.com
+        - https://pi.pardot.com
+        - https://pi.demo.pardot.com
 
 
 app:

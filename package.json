@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@forge/api": "^4.3.0",
-    "@forge/resolver": "^1.7.1"
+    "@forge/resolver": "^1.7.1",
+    "jsonwebtoken": "^9.0.3"
   }
 }
